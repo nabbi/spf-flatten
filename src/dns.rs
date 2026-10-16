@@ -2,6 +2,7 @@
 //! DNS lookups behind a small trait, so evaluation runs the same against live
 //! DNS, fixtures in tests, or a proposed set of records layered over live DNS.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -26,12 +27,42 @@ pub trait Dns {
     fn a(&self, name: &str) -> Result<Vec<Ipv4Addr>, DnsError>;
     fn aaaa(&self, name: &str) -> Result<Vec<Ipv6Addr>, DnsError>;
     fn mx(&self, name: &str) -> Result<Vec<String>, DnsError>;
+
+    /// Lowest TTL seen in the last answer for `name` and `rtype` ("TXT", "A",
+    /// "AAAA", "MX"), if known. Used to judge how often a record may change.
+    fn ttl(&self, _name: &str, _rtype: &'static str) -> Option<u32> {
+        None
+    }
 }
 
 /// Live DNS through hickory, blocking on a private single-threaded runtime.
 pub struct SystemDns {
     rt: tokio::runtime::Runtime,
     resolver: TokioResolver,
+    options: ResolverOpts,
+    ttls: RefCell<HashMap<(String, &'static str), u32>>,
+    /// Ask each zone's own servers for TTLs (see [`SystemDns::authoritative_ttls`]).
+    authoritative: bool,
+    auth_resolvers: RefCell<HashMap<IpAddr, TokioResolver>>,
+    auth_ttls: RefCell<HashMap<(String, &'static str), Option<u32>>>,
+}
+
+fn record_type(label: &str) -> Option<RecordType> {
+    Some(match label {
+        "TXT" => RecordType::TXT,
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "MX" => RecordType::MX,
+        _ => return None,
+    })
+}
+
+fn fqdn(name: &str) -> String {
+    if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    }
 }
 
 impl SystemDns {
@@ -43,7 +74,7 @@ impl SystemDns {
         let (servers, options) = if nameservers.is_empty() {
             let (config, options) = read_system_conf()?;
             // resolv.conf may list fe80:: servers with an interface scope, which
-            // hickory drops, leaving them unreachable. Skip them if others exist.
+            // hickory drops. Skip them if others exist.
             let routable: Vec<NameServerConfig> = config
                 .name_servers()
                 .iter()
@@ -63,17 +94,91 @@ impl SystemDns {
                 .collect();
             (servers, ResolverOpts::default())
         };
-        let builder = Resolver::builder_with_config(
-            ResolverConfig::from_name_servers(servers),
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(options);
-        // The resolver spawns background tasks, so build it inside the runtime.
-        let resolver = {
-            let _guard = rt.enter();
-            builder.build()?
-        };
-        Ok(Self { rt, resolver })
+        // hickory 0.26 gives up on a truncated answer when it queries two servers
+        // in parallel: the first switches the request to TCP and the second's
+        // truncated UDP answer then ends it. One at a time retries over TCP.
+        let mut options = options;
+        options.num_concurrent_reqs = 1;
+        let resolver = build_resolver(&rt, servers, options.clone())?;
+        Ok(Self {
+            rt,
+            resolver,
+            options,
+            ttls: RefCell::default(),
+            authoritative: false,
+            auth_resolvers: RefCell::default(),
+            auth_ttls: RefCell::default(),
+        })
+    }
+
+    /// Report TTLs from each zone's authoritative servers instead of the
+    /// resolver, whose cached answers count down. Costs extra queries, so only
+    /// drift scoring uses it.
+    pub fn authoritative_ttls(mut self) -> Self {
+        self.authoritative = true;
+        self
+    }
+
+    /// Addresses of the servers for the zone holding `name`: the nearest
+    /// enclosing name with NS records.
+    fn zone_servers(&self, name: &str) -> Vec<IpAddr> {
+        let mut candidate = key(name);
+        loop {
+            let hosts = self
+                .lookup(&candidate, RecordType::NS, "NS", |d| match d {
+                    RData::NS(ns) => Some(exchange_name(&ns.0)),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if !hosts.is_empty() {
+                return hosts
+                    .iter()
+                    .take(2)
+                    .flat_map(|h| self.a(h).unwrap_or_default())
+                    .map(IpAddr::V4)
+                    .collect();
+            }
+            match candidate.split_once('.') {
+                Some((_, parent)) if parent.contains('.') => candidate = parent.to_string(),
+                _ => return Vec::new(),
+            }
+        }
+    }
+
+    fn authoritative_ttl(&self, name: &str, label: &'static str) -> Option<u32> {
+        let k = (key(name), label);
+        if let Some(t) = self.auth_ttls.borrow().get(&k) {
+            return *t;
+        }
+        let rtype = record_type(label)?;
+        let mut ttl = None;
+        for ip in self.zone_servers(name) {
+            let resolver = {
+                let mut cache = self.auth_resolvers.borrow_mut();
+                match cache.get(&ip) {
+                    Some(r) => r.clone(),
+                    None => {
+                        let r = build_resolver(
+                            &self.rt,
+                            vec![NameServerConfig::udp_and_tcp(ip)],
+                            self.options.clone(),
+                        )
+                        .ok()?;
+                        cache.insert(ip, r.clone());
+                        r
+                    }
+                }
+            };
+            if let Ok(lookup) = self
+                .rt
+                .block_on(resolver.lookup(fqdn(name).as_str(), rtype))
+            {
+                ttl = lookup.answers().iter().map(|r| r.ttl).min();
+                break;
+            }
+        }
+        self.auth_ttls.borrow_mut().insert(k, ttl);
+        ttl
     }
 
     fn lookup<T>(
@@ -83,17 +188,17 @@ impl SystemDns {
         label: &'static str,
         pick: impl Fn(&RData) -> Option<T>,
     ) -> Result<Vec<T>, DnsError> {
-        let fqdn = if name.ends_with('.') {
-            name.to_string()
-        } else {
-            format!("{name}.")
-        };
-        match self.rt.block_on(self.resolver.lookup(fqdn.as_str(), rtype)) {
-            Ok(lookup) => Ok(lookup
-                .answers()
-                .iter()
-                .filter_map(|r| pick(&r.data))
-                .collect()),
+        match self
+            .rt
+            .block_on(self.resolver.lookup(fqdn(name).as_str(), rtype))
+        {
+            Ok(lookup) => {
+                let answers = lookup.answers();
+                if let Some(ttl) = answers.iter().map(|r| r.ttl).min() {
+                    self.ttls.borrow_mut().insert((key(name), label), ttl);
+                }
+                Ok(answers.iter().filter_map(|r| pick(&r.data)).collect())
+            }
             Err(e) if e.is_no_records_found() => Ok(Vec::new()),
             Err(e) => Err(DnsError {
                 name: name.to_string(),
@@ -102,6 +207,21 @@ impl SystemDns {
             }),
         }
     }
+}
+
+fn build_resolver(
+    rt: &tokio::runtime::Runtime,
+    servers: Vec<NameServerConfig>,
+    options: ResolverOpts,
+) -> anyhow::Result<TokioResolver> {
+    let builder = Resolver::builder_with_config(
+        ResolverConfig::from_name_servers(servers),
+        TokioRuntimeProvider::default(),
+    )
+    .with_options(options);
+    // The resolver spawns background tasks, so build it inside the runtime.
+    let _guard = rt.enter();
+    Ok(builder.build()?)
 }
 
 fn exchange_name(name: impl ToString) -> String {
@@ -142,6 +262,15 @@ impl Dns for SystemDns {
             _ => None,
         })
     }
+
+    fn ttl(&self, name: &str, rtype: &'static str) -> Option<u32> {
+        if self.authoritative {
+            return self
+                .authoritative_ttl(name, rtype)
+                .or_else(|| self.ttls.borrow().get(&(key(name), rtype)).copied());
+        }
+        self.ttls.borrow().get(&(key(name), rtype)).copied()
+    }
 }
 
 /// Records held in memory, for tests and offline use. Names are matched
@@ -152,6 +281,7 @@ pub struct StaticDns {
     a: HashMap<String, Vec<Ipv4Addr>>,
     aaaa: HashMap<String, Vec<Ipv6Addr>>,
     mx: HashMap<String, Vec<String>>,
+    ttls: HashMap<(String, &'static str), u32>,
     fail: Vec<String>,
 }
 
@@ -164,9 +294,9 @@ impl StaticDns {
         Self::default()
     }
 
-    /// Parse zone-like lines: `name TYPE value`, where TYPE is TXT, A, AAAA,
-    /// MX or FAIL (every lookup of the name is a temporary error). TXT values
-    /// may be quoted. Blank lines and `;` or `#` comments are skipped.
+    /// Parse zone-like lines: `name [ttl] TYPE value`, where TYPE is TXT, A,
+    /// AAAA, MX or FAIL (every lookup of the name is a temporary error). TXT
+    /// values may be quoted. Blank lines and `;` or `#` comments are skipped.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut dns = Self::new();
         for (n, line) in text.lines().enumerate() {
@@ -178,17 +308,46 @@ impl StaticDns {
             let Some((name, rest)) = line.split_once(char::is_whitespace) else {
                 return Err(bad());
             };
-            let rest = rest.trim_start();
-            let (rtype, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let split = |s: &'_ str| {
+                let s = s.trim_start();
+                s.split_once(char::is_whitespace)
+                    .map_or((s.to_string(), String::new()), |(a, b)| {
+                        (a.to_string(), b.to_string())
+                    })
+            };
+            let (mut rtype, mut value) = split(rest);
+            let mut ttl = None;
+            if let Ok(n) = rtype.parse::<u32>() {
+                ttl = Some(n);
+                (rtype, value) = split(&value);
+            }
             let value = value.trim();
-            match rtype.to_ascii_uppercase().as_str() {
-                "TXT" => dns.add_txt(name, value.trim_matches('"')),
-                "A" => dns.add_a(name, value.parse().map_err(|_| bad())?),
-                "AAAA" => dns.add_aaaa(name, value.parse().map_err(|_| bad())?),
-                "MX" => dns.add_mx(name, value),
-                "FAIL" => dns.add_failure(name),
+            let label = match rtype.to_ascii_uppercase().as_str() {
+                "TXT" => {
+                    dns.add_txt(name, value.trim_matches('"'));
+                    "TXT"
+                }
+                "A" => {
+                    dns.add_a(name, value.parse().map_err(|_| bad())?);
+                    "A"
+                }
+                "AAAA" => {
+                    dns.add_aaaa(name, value.parse().map_err(|_| bad())?);
+                    "AAAA"
+                }
+                "MX" => {
+                    dns.add_mx(name, value);
+                    "MX"
+                }
+                "FAIL" => {
+                    dns.add_failure(name);
+                    "FAIL"
+                }
                 _ => return Err(bad()),
             };
+            if let Some(ttl) = ttl {
+                dns.ttls.insert((key(name), label), ttl);
+            }
         }
         Ok(dns)
     }
@@ -252,6 +411,9 @@ impl Dns for StaticDns {
     fn mx(&self, name: &str) -> Result<Vec<String>, DnsError> {
         self.get(&self.mx, name, "MX")
     }
+    fn ttl(&self, name: &str, rtype: &'static str) -> Option<u32> {
+        self.ttls.get(&(key(name), rtype)).copied()
+    }
 }
 
 /// TXT records for some names replaced, everything else from `inner`. Used to
@@ -286,5 +448,11 @@ impl Dns for Overlay<'_> {
     }
     fn mx(&self, name: &str) -> Result<Vec<String>, DnsError> {
         self.inner.mx(name)
+    }
+    fn ttl(&self, name: &str, rtype: &'static str) -> Option<u32> {
+        match rtype {
+            "TXT" if self.txt.contains_key(&key(name)) => None,
+            _ => self.inner.ttl(name, rtype),
+        }
     }
 }

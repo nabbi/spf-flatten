@@ -22,6 +22,8 @@ pub struct Plan {
     pub records: Vec<TxtRecord>,
     pub lookups: usize,
     pub prefixes: usize,
+    /// Set when the config widens prefixes (`widen_ipv4`/`widen_ipv6`).
+    pub widening: Option<Widening>,
     pub live: Vec<Live>,
 }
 
@@ -31,6 +33,72 @@ pub fn summarize(ranges: &[Range], exclude: &[Range]) -> Vec<Prefix> {
     ranges.iter().for_each(|r| agg.add(*r));
     exclude.iter().for_each(|r| agg.exclude(*r));
     agg.summarize()
+}
+
+/// What widening cost: addresses authorized beyond what the sources list.
+#[derive(Debug, Clone, Serialize)]
+pub struct Widening {
+    pub ipv4_prefix: Option<u8>,
+    pub ipv6_prefix: Option<u8>,
+    /// Source prefixes that were rounded out.
+    pub widened: usize,
+    pub extra_ipv4_addresses: u128,
+    /// Extra IPv6 space, counted in /64 networks.
+    pub extra_ipv6_64s: u128,
+}
+
+fn size(prefixes: &[Prefix], family: Family) -> u128 {
+    prefixes
+        .iter()
+        .filter(|p| p.family() == family)
+        .map(|p| {
+            let r = p.range();
+            (r.end() - r.start()).saturating_add(1)
+        })
+        .fold(0u128, u128::saturating_add)
+}
+
+/// The prefixes a config publishes: `ranges` aggregated, each prefix longer
+/// than the widening length rounded out to it, then exclusions removed.
+pub fn effective(cfg: &Config, ranges: &[Range]) -> (Vec<Prefix>, Option<Widening>) {
+    if cfg.widen_ipv4.is_none() && cfg.widen_ipv6.is_none() {
+        return (summarize(ranges, &cfg.exclude), None);
+    }
+    let exact = summarize(ranges, &[]);
+    let mut widened = 0;
+    let rounded: Vec<Range> = exact
+        .iter()
+        .map(|p| {
+            let limit = match p.family() {
+                Family::V4 => cfg.widen_ipv4,
+                Family::V6 => cfg.widen_ipv6,
+            };
+            match limit {
+                Some(len) if p.prefix_len() > len => {
+                    widened += 1;
+                    let bits = p.family().bits();
+                    let host = if len == 0 {
+                        u128::MAX
+                    } else {
+                        (1u128 << (bits - len)) - 1
+                    };
+                    let start = p.range().start() & !host;
+                    Range::new(p.family(), start, start | host).expect("within family")
+                }
+                _ => p.range(),
+            }
+        })
+        .collect();
+    let out = summarize(&rounded, &cfg.exclude);
+    let exact = summarize(ranges, &cfg.exclude);
+    let w = Widening {
+        ipv4_prefix: cfg.widen_ipv4,
+        ipv6_prefix: cfg.widen_ipv6,
+        widened,
+        extra_ipv4_addresses: size(&out, Family::V4) - size(&exact, Family::V4),
+        extra_ipv6_64s: (size(&out, Family::V6) - size(&exact, Family::V6)) >> 64,
+    };
+    (out, Some(w))
 }
 
 pub fn ip_term(p: &Prefix) -> String {
@@ -60,7 +128,23 @@ fn fitting<S: AsRef<str>>(tokens: &[S], room: usize) -> usize {
 /// Pack the flattened addresses and live terms into records within the size
 /// and lookup budgets.
 pub fn pack(cfg: &Config, flat: &Flat) -> Result<Plan, String> {
-    let prefixes = summarize(&flat.pass, &cfg.exclude);
+    let plan = pack_records(cfg, flat)?;
+    let chain = plan.records.len() - 1;
+    if plan.lookups > cfg.max_lookups {
+        return Err(format!(
+            "the flattened record needs {} lookups ({} from kept terms, {chain} chained records), over max_lookups {}; \
+             keep fewer sources or raise max_record_bytes",
+            plan.lookups,
+            plan.lookups - chain,
+            cfg.max_lookups
+        ));
+    }
+    Ok(plan)
+}
+
+/// Pack within the size budget only; the plan may need too many lookups.
+pub fn pack_records(cfg: &Config, flat: &Flat) -> Result<Plan, String> {
+    let (prefixes, widening) = effective(cfg, &flat.pass);
     let ips: Vec<String> = prefixes.iter().map(ip_term).collect();
 
     let mut live: Vec<Live> = Vec::new();
@@ -118,19 +202,11 @@ pub fn pack(cfg: &Config, flat: &Flat) -> Result<Plan, String> {
         }
 
         let lookups = live.iter().map(|l| l.lookups).sum::<usize>() + chain.len();
-        if lookups > cfg.max_lookups {
-            return Err(format!(
-                "the flattened record needs {lookups} lookups ({} from kept terms, {} chained records), over max_lookups {}; \
-                 keep fewer sources or raise max_record_bytes",
-                lookups - chain.len(),
-                chain.len(),
-                cfg.max_lookups
-            ));
-        }
         return Ok(Plan {
             records,
             lookups,
             prefixes: prefixes.len(),
+            widening,
             live,
         });
     }
@@ -164,8 +240,8 @@ fn all_text(q: Option<Qualifier>) -> String {
 }
 
 /// Compare what two policies authorize, address by address.
-pub fn compare(want: &Flat, want_exclude: &[Range], have: &Flat) -> Comparison {
-    let want_pass: Vec<Range> = summarize(&want.pass, want_exclude)
+pub fn compare(want: &Flat, have: &Flat) -> Comparison {
+    let want_pass: Vec<Range> = summarize(&want.pass, &[])
         .iter()
         .map(Prefix::range)
         .collect();
@@ -252,10 +328,15 @@ pub fn verify(cfg: &Config, plan: &Plan, expected: &Flat, dns: &dyn Dns) -> Vec<
     }
     // The config's sources carry no `all`; the policy is added when packing.
     let expected = Flat {
+        pass: effective(cfg, &expected.pass)
+            .0
+            .iter()
+            .map(Prefix::range)
+            .collect(),
         all: Some(cfg.policy),
         ..expected.clone()
     };
-    let diff = compare(&expected, &cfg.exclude, &actual);
+    let diff = compare(&expected, &actual);
     if !diff.missing.is_empty() {
         fail(format!("does not authorize {}", diff.missing.join(" ")));
     }
@@ -387,5 +468,28 @@ mod tests {
         let flat = ev.evaluate_terms(&cfg.domain, &cfg.terms, &cfg.keep);
         let err = pack(&cfg, &flat).unwrap_err();
         assert!(err.contains("needs 12 lookups"), "{err}");
+    }
+
+    #[test]
+    fn widening_rounds_out_and_counts() {
+        let mut dns = StaticDns::new();
+        dns.add_txt(
+            "p.example",
+            "v=spf1 ip4:192.0.2.1 ip4:192.0.2.9 ip4:198.51.100.0/23 ip6:2001:db8::1 ~all",
+        );
+        let cfg = config(
+            "widen_ipv4 = 24\nwiden_ipv6 = 48\nexclude = [\"192.0.2.128/25\"]",
+            "[[source]]\ninclude = \"p.example\"\n",
+        );
+        let (plan, problems) = run(&cfg, &dns);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            plan.records[0].value,
+            "v=spf1 ip4:192.0.2.0/25 ip4:198.51.100.0/23 ip6:2001:db8::/48 -all"
+        );
+        let w = plan.widening.unwrap();
+        assert_eq!(w.widened, 3);
+        assert_eq!(w.extra_ipv4_addresses, 126);
+        assert_eq!(w.extra_ipv6_64s, 65535);
     }
 }

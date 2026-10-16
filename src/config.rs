@@ -28,6 +28,11 @@ struct Raw {
     apex_ips: bool,
     #[serde(default)]
     exclude: Vec<String>,
+    widen_ipv4: Option<u8>,
+    widen_ipv6: Option<u8>,
+    #[serde(default)]
+    strategy: Strategy,
+    headroom: Option<usize>,
     #[serde(default, rename = "source")]
     sources: Vec<Source>,
 }
@@ -122,6 +127,18 @@ impl Source {
     }
 }
 
+/// How much to flatten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Strategy {
+    /// Flatten every source not marked keep.
+    #[default]
+    Full,
+    /// Flatten only as many sources as the lookup budget needs, lowest drift
+    /// risk first; the rest stay live.
+    Minimal,
+}
+
 /// A validated config.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -134,6 +151,12 @@ pub struct Config {
     /// Put addresses in the apex record when they fit, saving a lookup.
     pub apex_ips: bool,
     pub exclude: Vec<Range>,
+    /// Round flattened prefixes longer than this out to it ("aggressive" mode).
+    pub widen_ipv4: Option<u8>,
+    pub widen_ipv6: Option<u8>,
+    pub strategy: Strategy,
+    /// Lookups to leave unused under the minimal strategy.
+    pub headroom: usize,
     pub terms: Vec<Term>,
     /// Parallel to `terms`: written verbatim instead of flattened.
     pub keep: Vec<bool>,
@@ -192,6 +215,27 @@ impl Config {
             .map(|e| parse_entry(e, true).map_err(|err| format!("exclude {e:?}: {err}")))
             .collect::<Result<Vec<_>, _>>()?;
 
+        if let Some(n) = raw.widen_ipv4
+            && !(16..=32).contains(&n)
+        {
+            return Err("widen_ipv4 must be 16 to 32".into());
+        }
+        if let Some(n) = raw.widen_ipv6
+            && !(32..=128).contains(&n)
+        {
+            return Err("widen_ipv6 must be 32 to 128".into());
+        }
+
+        // One spare lookup by default, so a provider adding a nested include
+        // doesn't push a minimally flattened record straight over the limit.
+        let headroom = raw.headroom.unwrap_or(usize::from(raw.max_lookups > 1));
+        if headroom >= raw.max_lookups {
+            return Err(format!(
+                "headroom must be less than max_lookups ({})",
+                raw.max_lookups
+            ));
+        }
+
         if raw.sources.is_empty() {
             return Err("no [[source]] entries".into());
         }
@@ -222,6 +266,10 @@ impl Config {
             ttl: raw.ttl,
             apex_ips: raw.apex_ips,
             exclude,
+            widen_ipv4: raw.widen_ipv4,
+            widen_ipv6: raw.widen_ipv6,
+            strategy: raw.strategy,
+            headroom,
             terms,
             keep,
             warnings,
@@ -266,7 +314,9 @@ pub fn render(domain: &str, policy: &str, entries: &[Entry], comments: &[String]
          # chain_prefix = {}\n\
          # ttl = {DEFAULT_TTL}\n\
          # apex_ips = true\n\
-         # exclude = []\n",
+         # exclude = []\n\
+         # strategy = \"full\"       # or \"minimal\": flatten only what the budget needs\n\
+         # headroom = 1             # lookups minimal leaves unused\n",
         q(DEFAULT_CHAIN_PREFIX)
     ));
     for e in entries {

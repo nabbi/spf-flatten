@@ -69,6 +69,11 @@ pub struct Node {
     pub void: bool,
     /// CIDR ranges this term matched directly or through its children.
     pub ranges: usize,
+    /// How many of those ranges are single addresses (/32 or /128).
+    pub hosts: usize,
+    /// Lowest TTL of the records this term itself looked up, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -119,8 +124,13 @@ impl Outcome {
     fn finish(mut self) -> Self {
         self.node.lookups = self.lookups;
         self.node.ranges = self.ranges.len();
+        self.node.hosts = host_count(&self.ranges);
         self
     }
+}
+
+fn host_count(ranges: &[Range]) -> usize {
+    ranges.iter().filter(|r| r.start() == r.end()).count()
 }
 
 pub struct Evaluator<'a> {
@@ -292,6 +302,7 @@ impl<'a> Evaluator<'a> {
             let (sub, void) = self.nested(target);
             out.voids += usize::from(void);
             node.void = void;
+            node.ttl = self.ttl(target, &["TXT"]);
             let Some(sub) = sub else {
                 out.tree.push(node);
                 return;
@@ -304,6 +315,7 @@ impl<'a> Evaluator<'a> {
             out.live.extend(sub.live);
             node.lookups = 1 + sub.lookups;
             node.ranges = sub.pass.len();
+            node.hosts = host_count(&sub.pass);
             node.children = sub.tree;
         }
         out.tree.push(node);
@@ -359,17 +371,18 @@ impl<'a> Evaluator<'a> {
             Mechanism::Include(_) => self.include(&mut o, q, &text, &target, keep),
             Mechanism::A(h) => {
                 if keep {
-                    o.live.push(live(&text, 1, "kept by config"));
+                    o.live.push(live(&text, 1, "kept live"));
                 } else {
                     let (ranges, void) = self.addresses(&target, h);
                     o.ranges = ranges;
                     o.voids = usize::from(void);
                     o.node.void = void;
+                    o.node.ttl = self.ttl(&target, &["A", "AAAA"]);
                 }
             }
             Mechanism::Mx(h) => {
                 if keep {
-                    o.live.push(live(&text, 1, "kept by config"));
+                    o.live.push(live(&text, 1, "kept live"));
                 } else {
                     self.mx(&mut o, &target, h);
                 }
@@ -398,6 +411,7 @@ impl<'a> Evaluator<'a> {
 
     fn include(&mut self, o: &mut Outcome, q: Qualifier, text: &str, target: &str, keep: bool) {
         let (sub, void) = self.nested(target);
+        o.node.ttl = self.ttl(target, &["TXT"]);
         if void {
             o.voids += 1;
             o.node.void = true;
@@ -414,7 +428,7 @@ impl<'a> Evaluator<'a> {
         let lifts = sub.live.is_empty() || (sub.portable && q == Qualifier::Pass);
         if keep || !lifts {
             let reason = if keep {
-                "kept by config"
+                "kept live"
             } else {
                 "contains terms that only work inside it"
             };
@@ -447,9 +461,11 @@ impl<'a> Evaluator<'a> {
                 names.len()
             ));
         }
+        o.node.ttl = self.ttl(target, &["MX"]);
         for name in names.iter().take(MAX_NAMES) {
             let (ranges, _) = self.addresses(name, h);
             o.ranges.extend(ranges);
+            o.node.ttl = min_opt(o.node.ttl, self.ttl(name, &["A", "AAAA"]));
         }
         o.node.note = Some(format!("{} MX hosts", names.len()));
     }
@@ -477,6 +493,22 @@ impl<'a> Evaluator<'a> {
             })
             .collect();
         (ranges, void)
+    }
+}
+
+fn min_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+impl Evaluator<'_> {
+    /// Lowest known TTL of `name` across record types.
+    fn ttl(&self, name: &str, rtypes: &[&'static str]) -> Option<u32> {
+        rtypes
+            .iter()
+            .fold(None, |acc, t| min_opt(acc, self.dns.ttl(name, t)))
     }
 }
 

@@ -3,6 +3,11 @@
 domain = "example.com"
 policy = "-all"            # -all, ~all or ?all
 
+# Flatten only what the 10-lookup budget needs, lowest drift risk first; the
+# rest stay live includes that can't go stale. Use "full" to flatten everything.
+strategy = "minimal"
+# headroom = 1             # lookups minimal leaves unused
+
 # Optional settings, with their defaults:
 # max_lookups = 10         # lookup budget for the result (RFC 7208 limit is 10)
 # max_record_bytes = 450   # per TXT record; keeps answers in one UDP packet
@@ -10,6 +15,7 @@ policy = "-all"            # -all, ~all or ?all
 # ttl = 3600               # TTL in zone output
 # apex_ips = true          # put addresses in the apex record when they fit
 # exclude = []             # addresses to remove from the result
+# widen_ipv4 = 24          # round prefixes out (authorizes neighbours: see README)
 
 [[source]]
 include = "_spf.google.com"
@@ -21,11 +27,12 @@ note = "transactional mail"
 
 [[source]]
 include = "_spf.salesforce.com"
-keep = true                # publish as a live include instead of flattening
-note = "uses exists:%{i} macros; Salesforce asks customers not to flatten"
+keep = true                # never flatten, under either strategy
+note = "uses exists:%{i} macros"
 
 [[source]]
 mx = "@"                   # "@" is the domain itself; "@/24" adds a CIDR length
+keep = true                # own hosts: follow them as they move
 
 [[source]]
 ip4 = ["203.0.113.10", "198.51.100.0/24"]

@@ -11,38 +11,114 @@ and refuses to print them unless they authorize exactly the same senders within
 the limits.
 
 ```console
-$ spf-flatten import github.com -o spf.toml      # start from what's live
-$ spf-flatten flatten -i spf.toml
-; SPF for github.com flattened by spf-flatten 0.1.0: 58 prefixes, 3 of 10 lookups
-github.com.       3600 IN TXT "v=spf1 ip4:37.188.97.188 ip4:40.92.0.0/15 ..." " ... exists:%{i}._spf.mta.salesforce.com include:_spf1.github.com include:_spf2.github.com ~all"
-_spf1.github.com. 3600 IN TXT "v=spf1 ip4:134.128.64.0/18 ..."
-_spf2.github.com. 3600 IN TXT "v=spf1 ip4:208.117.48.0/20 ... ip6:2c0f:fb50:4000::/36"
-github.com: 58 prefixes in 3 record(s), 3 of 10 lookups (unflattened: 10)
+$ spf-flatten check github.com                   # what's wrong, and a fix
+$ spf-flatten import github.com -o spf.toml      # start a config from what's live
+$ spf-flatten flatten -i spf.toml --minimal      # flatten only what's needed
+$ spf-flatten risk -i spf.toml --state state.json
+$ spf-flatten diff -i spf.toml                   # on a schedule: has it drifted?
 ```
 
 ## Commands
 
-| Command | What it does | Exit status |
+| Command | What it does | Exit 1 when |
 |---|---|---|
-| `check DOMAIN` | Evaluate the published record: per-term lookup tree, lookup and void counts, size, problems | 1 on errors |
-| `import DOMAIN [-o FILE]` | Write a config from the published record, with each source's lookup cost | 1 if there's no usable record |
-| `flatten [-i FILE] [-f zone\|json\|plain] [-o FILE]` | Resolve, pack and verify; print the records | 2 on errors |
-| `diff [-i FILE]` | Compare what the config would publish with what DNS serves now | 1 on drift |
+| `check DOMAIN` | Evaluate the published record: lookup tree, limits, own-host advice, and a verified minimal flattening | the record has errors (over 10 lookups, missing includes...) |
+| `import DOMAIN [-o FILE]` | Write a config from the published record, with each source's lookup cost | |
+| `flatten [-i FILE] [-f zone\|json\|plain] [-o FILE]` | Resolve, pack and verify; print the records | |
+| `diff [-i FILE]` | Compare what the config would publish with what DNS serves now | the published records authorize different senders |
+| `risk [-i FILE] [--state FILE] [--fail-on medium\|high]` | Score each source's chance of drifting once flattened | a source reaches `--fail-on` |
 
-`-i -` reads the config from stdin. Global options: `--nameserver IP`
-(repeatable) to bypass the system resolver, and `--dns-file FILE` to answer
-from a fixture file instead (see `tests/fixtures/zone.txt`).
+Exit status 2 means the command could not run: a bad config, a DNS failure, or
+a result that can't fit the budget. `-i -` reads the config from stdin.
 
-Exit status 2 means the command could not run: a bad config, a DNS failure,
-or a result that can't fit the budget.
+Global options:
+
+- `--json`: print one JSON document on stdout ([schema](docs/json.md))
+- `-q`: no diagnostics on stderr
+- `--minimal`, `--headroom N`: the minimal strategy (below)
+- `--nameserver IP` (repeatable, default 1.1.1.1), `--system-resolver`, or
+  `--dns-file FILE` (fixtures, see `tests/fixtures/zone.txt`). The default
+  avoids local resolvers whose blocklists or split views skew results.
+
+## Strategies: how much to flatten
+
+Every flattened address is a snapshot. When a provider changes its ranges, a
+flattened record keeps the old ones until you republish, and mail from the new
+ones fails. A source left live (`include:`) can't go stale. So flatten as little
+as you can.
+
+- **`strategy = "full"`** (default): flatten every source except those marked
+  `keep = true`. The fewest lookups, the most snapshots.
+- **`strategy = "minimal"`** (or `--minimal`): start from the record as
+  published, every source live, and flatten one source at a time, lowest drift
+  risk first, until the record fits `max_lookups - headroom`. Then return any
+  source that is no longer needed to live, riskiest first. `headroom` defaults
+  to 1, so a provider adding a nested include doesn't push the record straight
+  back over the limit. If the record already fits, nothing is flattened.
+
+`check` always suggests the minimal plan and says what it flattened and why:
+
+```
+suggested flattened records (9 of 10 lookups, verified):
+...
+minimal flattening, lowest drift risk first:
+  live      low    exists:%{i}._spf.mta.salesforce.com (live: not needed to meet the budget)
+  flattened low    include:spf.protection.outlook.com (flattened: low drift risk, saves lookups)
+  live      high   include:_spf.example-saas.com (live: not needed to meet the budget)
+```
+
+## Drift risk
+
+`risk` scores each source from evidence the code can see:
+
+| Signal | Why it predicts drift | Points |
+|---|---|---|
+| Authoritative TTL ≤ 300s / < 3600s | the publisher expects to change it soon | 2 / 1 |
+| Mostly single-address prefixes (5+) | cloud instances get replaced | 2 (1 for 3+) |
+| 2+ nested records | the provider can rearrange its tree | 1 |
+| `a` / `mx` source | follows your own hosts as they move | 1 |
+| Changed within 30 days (with `--state`) | observed churn | 3 (1 if older) |
+
+0-1 points is **low**, 2-3 **medium**, 4+ **high**. Sources with nothing
+flattened from them (kept, or only per-message terms) are always low.
+
+TTLs come from each zone's own name servers, not the resolver: a caching
+resolver returns TTLs that count down, which would make scores, and the minimal
+strategy's choices, change from run to run.
+
+History is the strongest signal. Run `risk --state FILE` on a schedule (daily is
+plenty); each run records every source's resolved prefixes and counts changes.
+DNS failures are never recorded as changes. `risk` also suggests which risky
+sources to keep live within the spare lookups.
+
+## Own hosts (`a` and `mx`)
+
+`check` validates the record, then looks at the domain's own hosts:
+
+- `redundant-own-host`: an `a`/`mx` term whose addresses other terms already
+  cover. Removing it saves a lookup.
+- `mx-inbound-gateway`: `mx` points at an inbound filtering service (Microsoft
+  365, Google, Proofpoint, Mimecast...) that doesn't send your outbound mail.
+- `keep-own-host`: an `a`/`mx` term that does authorize your hosts. Keep it live
+  when flattening, so it follows host moves; `check`'s suggestion does.
+- `mx-not-authorized`: the domain's MX hosts aren't authorized. Only MX hosts
+  are checked; a domain's A record is usually its website, not a mail sender.
 
 ## Config
 
 See [`examples/spf.toml`](examples/spf.toml). Each `[[source]]` sets exactly one
 of `include`, `a`, `mx`, `ptr`, `exists`, `ip4` or `ip6` (a list is allowed for
 `ip4` and `ip6`). For `a`, `mx` and `ptr`, `"@"` means the domain itself.
-`keep = true` publishes a source as a live term instead of flattening it.
-Kept sources still count against `max_lookups`.
+`keep = true` pins a source live under either strategy; it still counts against
+`max_lookups`.
+
+### Widening (use with care)
+
+`widen_ipv4 = 24` / `widen_ipv6 = 48` round every flattened prefix out to at
+least that size, so a provider adding a host next to its existing ones stays
+covered. The cost is real: widening a cloud host to its /24 also authorizes
+every other tenant on that /24 to send as you. Every run reports how many extra
+addresses widening authorizes. Prefer the minimal strategy.
 
 ## What can't be flattened
 
@@ -56,18 +132,10 @@ Kept sources still count against `max_lookups`.
   top-level sources only pass terms are supported. `import` drops the others
   and lists them in comments.
 
-## Drift
+## Automation
 
-Flattened records go stale when providers change their ranges. Run `diff`
-on a schedule, and republish when it exits 1:
-
-```sh
-spf-flatten diff -i spf.toml || notify "SPF drift for example.com"
-```
-
-`diff` compares what the records *authorize*, not their text. A repack that
-moves addresses between records but authorizes the same senders counts as
-in sync.
+See [docs/automation.md](docs/automation.md) for cron and systemd timers, CI,
+publishing through DNS APIs, and alerting with `jq`.
 
 ## Build
 

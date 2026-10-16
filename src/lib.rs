@@ -7,10 +7,13 @@
 //! those records as if published to confirm they authorize exactly the same
 //! senders within the limits.
 
+pub mod advice;
 pub mod config;
 pub mod dns;
 pub mod eval;
 pub mod flatten;
 pub mod import;
+pub mod minimal;
 pub mod output;
+pub mod risk;
 pub mod spf;

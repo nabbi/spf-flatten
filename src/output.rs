@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Render flattened records and evaluation trees.
+//! Render flattened records, evaluation trees and risk reports.
 
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::eval::{Live, Node, Problem};
+use crate::eval::Node;
 use crate::flatten::Plan;
+use crate::risk::{SourceRisk, Suggestion};
+
+/// Bumped when a JSON document changes incompatibly (see docs/json.md).
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Longest DNS character-string (RFC 1035 §3.3).
 const MAX_STRING: usize = 255;
@@ -55,6 +59,12 @@ pub fn zone(cfg: &Config, plan: &Plan) -> String {
         plan.lookups,
         cfg.max_lookups
     );
+    if let Some(w) = &plan.widening {
+        out.push_str(&format!(
+            "; widened {} prefixes: {} extra IPv4 addresses authorized\n",
+            w.widened, w.extra_ipv4_addresses
+        ));
+    }
     for r in &plan.records {
         let strings: Vec<String> = split_strings(&r.value).iter().map(|s| quote(s)).collect();
         out.push_str(&format!(
@@ -75,54 +85,28 @@ pub fn plain(plan: &Plan) -> String {
         .collect()
 }
 
-#[derive(Serialize)]
-struct JsonRecord<'a> {
-    name: &'a str,
-    ttl: u32,
-    value: &'a str,
-    strings: Vec<String>,
-    bytes: usize,
+/// A record as it appears in JSON documents.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRecord {
+    pub name: String,
+    pub ttl: u32,
+    pub value: String,
+    /// The value split into the character-strings a zone needs.
+    pub strings: Vec<String>,
+    pub bytes: usize,
 }
 
-#[derive(Serialize)]
-struct JsonPlan<'a> {
-    domain: &'a str,
-    policy: String,
-    lookups: usize,
-    max_lookups: usize,
-    prefixes: usize,
-    records: Vec<JsonRecord<'a>>,
-    kept: &'a [Live],
-    warnings: Vec<String>,
-}
-
-pub fn json(cfg: &Config, plan: &Plan, warnings: &[Problem]) -> String {
-    let doc = JsonPlan {
-        domain: &cfg.domain,
-        policy: cfg.policy_term(),
-        lookups: plan.lookups,
-        max_lookups: cfg.max_lookups,
-        prefixes: plan.prefixes,
-        records: plan
-            .records
-            .iter()
-            .map(|r| JsonRecord {
-                name: &r.name,
-                ttl: cfg.ttl,
-                value: &r.value,
-                strings: split_strings(&r.value),
-                bytes: r.value.len(),
-            })
-            .collect(),
-        kept: &plan.live,
-        warnings: cfg
-            .warnings
-            .iter()
-            .cloned()
-            .chain(warnings.iter().map(|p| p.to_string()))
-            .collect(),
-    };
-    serde_json::to_string_pretty(&doc).expect("serializable") + "\n"
+pub fn json_records(cfg: &Config, plan: &Plan) -> Vec<JsonRecord> {
+    plan.records
+        .iter()
+        .map(|r| JsonRecord {
+            name: r.name.clone(),
+            ttl: cfg.ttl,
+            value: r.value.clone(),
+            strings: split_strings(&r.value),
+            bytes: r.value.len(),
+        })
+        .collect()
 }
 
 /// An indented tree of evaluated terms with their lookup cost.
@@ -144,6 +128,9 @@ pub fn tree(nodes: &[Node]) -> String {
                     k => format!("{k} ranges"),
                 });
             }
+            if let Some(ttl) = n.ttl {
+                detail.push(format!("ttl {ttl}"));
+            }
             if let Some(note) = &n.note {
                 detail.push(note.clone());
             }
@@ -158,6 +145,44 @@ pub fn tree(nodes: &[Node]) -> String {
     }
     let mut out = String::new();
     walk(nodes, 0, &mut out);
+    out
+}
+
+/// The risk table and suggestions, for people.
+pub fn risk(risks: &[SourceRisk], suggestions: &[Suggestion]) -> String {
+    let width = risks.iter().map(|r| r.source.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for r in risks {
+        let ttl = r
+            .min_ttl
+            .map_or("ttl ?".to_string(), |t| format!("ttl {t}"));
+        out.push_str(&format!(
+            "  {:<6}  {:<width$}  {} lookups, {} prefixes ({} hosts), {}\n",
+            r.level.to_string(),
+            r.source,
+            r.lookups,
+            r.prefixes,
+            r.hosts,
+            ttl
+        ));
+        for reason in &r.reasons {
+            out.push_str(&format!("          - {reason}\n"));
+        }
+        if let Some(h) = &r.history {
+            for p in &h.added {
+                out.push_str(&format!("          + {p} (new since last run)\n"));
+            }
+            for p in &h.removed {
+                out.push_str(&format!("          - {p} (gone since last run)\n"));
+            }
+        }
+    }
+    if !suggestions.is_empty() {
+        out.push_str("\nsuggestions:\n");
+        for s in suggestions {
+            out.push_str(&format!("  {}: {}\n", s.source, s.advice));
+        }
+    }
     out
 }
 
