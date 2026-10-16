@@ -1,0 +1,1 @@
+v=spf1 a mx:relay.example.com ip4:192.0.2.0/24 -all

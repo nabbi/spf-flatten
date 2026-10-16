@@ -1,0 +1,1 @@
+v=spf1 include:b.example ip4:192.0.2.0/25

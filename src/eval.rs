@@ -21,6 +21,10 @@ pub const MAX_VOIDS: usize = 2;
 /// Names an `mx` (or `ptr`) term may expand to.
 const MAX_NAMES: usize = 10;
 const MAX_DEPTH: usize = 20;
+/// Records fetched for one evaluation before giving up. Receivers stop at 10
+/// lookups; this goes further to show how far over a record is, but a tree that
+/// includes the same records repeatedly grows exponentially with depth.
+const MAX_RECORDS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -137,6 +141,8 @@ pub struct Evaluator<'a> {
     dns: &'a dyn Dns,
     pub problems: Vec<Problem>,
     stack: Vec<String>,
+    /// Nested records fetched so far, against [`MAX_RECORDS`].
+    records: usize,
 }
 
 impl<'a> Evaluator<'a> {
@@ -145,6 +151,7 @@ impl<'a> Evaluator<'a> {
             dns,
             problems: Vec::new(),
             stack: Vec::new(),
+            records: 0,
         }
     }
 
@@ -331,6 +338,15 @@ impl<'a> Evaluator<'a> {
         }
         if self.stack.len() >= MAX_DEPTH {
             self.error(format!("nesting deeper than {MAX_DEPTH} at {target}"));
+            return (None, false);
+        }
+        self.records += 1;
+        if self.records > MAX_RECORDS {
+            if self.records == MAX_RECORDS + 1 {
+                self.error(format!(
+                    "stopped evaluating after {MAX_RECORDS} nested records (at {target})"
+                ));
+            }
             return (None, false);
         }
         self.stack.push(target.to_string());
@@ -636,6 +652,27 @@ mod tests {
         assert_eq!(flat.all, Some(Qualifier::SoftFail));
         assert_eq!(prefixes(&flat), ["192.0.2.1"]);
         assert!(problems.iter().any(|p| p.message.contains("loop")));
+    }
+
+    #[test]
+    fn repeated_includes_stop_early() {
+        // Each level includes the next twice: 2^19 records if walked in full.
+        let zone: String = (0..18)
+            .map(|d| {
+                format!(
+                    "l{d}.test TXT \"v=spf1 include:l{0}.test include:l{0}.test ~all\"\n",
+                    d + 1
+                )
+            })
+            .chain(["l18.test TXT \"v=spf1 ip4:192.0.2.1 ~all\"".to_string()])
+            .collect();
+        let (flat, problems) = eval(&zone, "l0.test");
+        assert!(flat.lookups <= 2 * MAX_RECORDS, "{} lookups", flat.lookups);
+        let stopped: Vec<_> = problems
+            .iter()
+            .filter(|p| p.message.contains("stopped"))
+            .collect();
+        assert_eq!(stopped.len(), 1, "{problems:?}");
     }
 
     #[test]

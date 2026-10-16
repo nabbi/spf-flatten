@@ -1,0 +1,1 @@
+v=spf1 include:%{ir}.%{v}._spf.%{d2} exists:%{l1r-}.x.example a:Example.COM./24//64 mx//48 ptr ?ip6:2001:DB8::/32 redirect=_spf.example.com exp=e.%{d} foo=bar -all

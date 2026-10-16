@@ -1,0 +1,22 @@
+# DNS answers for the CLI tests (--dns-file). Format: name TYPE value
+
+example.com          TXT "v=spf1 include:mail.provider.test include:crm.provider.test mx ~all"
+example.com          MX  mx1.example.com
+mx1.example.com      A   192.0.2.25
+mx1.example.com      AAAA 2001:db8::25
+
+mail.provider.test   TXT "v=spf1 include:_n1.provider.test include:_n2.provider.test ~all"
+_n1.provider.test    TXT "v=spf1 ip4:198.51.100.0/25 ip4:198.51.100.128/25 ~all"
+_n2.provider.test    TXT "v=spf1 ip6:2001:db8:100::/48 ~all"
+
+crm.provider.test    TXT "v=spf1 ip4:203.0.113.0/24 exists:%{i}._spf.crm.provider.test -all"
+
+# A domain already publishing flattened records that have drifted.
+drift.test           TXT "v=spf1 ip4:198.51.100.0/24 ip4:203.0.113.0/24 ~all"
+
+broken.test          TXT "v=spf1 include:missing.test -all"
+
+# Cloud-hosted provider: short TTL, single-host addresses.
+cloud.provider.test  300 TXT "v=spf1 ip4:192.0.2.10 ip4:192.0.2.11 ip4:192.0.2.40 ip4:192.0.2.77 ip4:192.0.2.200 -all"
+# Published with --aggressive from cloud.provider.test when it had fewer hosts.
+widened.test         TXT "v=spf1 ip4:192.0.2.0/24 -all"

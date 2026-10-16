@@ -1,0 +1,56 @@
+[package]
+name = "spf-flatten-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+route-summarization = "0.1"
+spf-flatten = { path = ".." }
+
+# Not part of the parent package; built with its own instrumentation flags.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "spf_record"
+path = "fuzz_targets/spf_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zone_eval"
+path = "fuzz_targets/zone_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flatten"
+path = "fuzz_targets/flatten.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "split_strings"
+path = "fuzz_targets/split_strings.rs"
+test = false
+doc = false
+bench = false

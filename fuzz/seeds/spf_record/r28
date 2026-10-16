@@ -1,0 +1,1 @@
+v=spf1 include:s1.stable.test include:s2.stable.test -all

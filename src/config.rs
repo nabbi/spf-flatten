@@ -245,6 +245,10 @@ impl Config {
             let kept = source.keep;
             for text in source.terms().map_err(|e| format!("source #{n}: {e}"))? {
                 let term = Term::parse(&text).map_err(|e| format!("source #{n}: {e}"))?;
+                // "@=x" would make `a`/`mx`/`ptr` a modifier, which receivers ignore.
+                if !matches!(term, Term::Directive(..)) {
+                    return Err(format!("source #{n}: {text:?} is not a mechanism"));
+                }
                 if kept && matches!(term, Term::Directive(_, Mechanism::Ip(..))) {
                     return Err(format!("source #{n}: keep has no effect on ip4/ip6"));
                 }
@@ -403,6 +407,9 @@ mod tests {
                 "unknown field",
             ),
             ("", "no [[source]]"),
+            // Found by fuzz/config: these became ignored modifiers "mxpt=" and "a=x".
+            ("[[source]]\nmx = \"@pt=\"\n", "not a mechanism"),
+            ("[[source]]\na = \"@=x\"\n", "not a mechanism"),
         ] {
             let e = Config::parse(&format!("{base}{body}")).unwrap_err();
             assert!(e.contains(why), "{body:?}: {e}");

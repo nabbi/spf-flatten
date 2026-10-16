@@ -1,0 +1,1 @@
+v=spf1 include:mail.provider.test include:crm.provider.test mx ~all

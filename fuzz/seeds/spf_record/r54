@@ -1,0 +1,1 @@
+v=spf1 ip4:192.0.2.1 mx include:p.example ip4:192.0.2.9 a:web.example.com/28 -ip4:10.0.0.1 redirect=r.example

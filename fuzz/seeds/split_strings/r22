@@ -1,0 +1,1 @@
+v=spf1 include:d1.deep.test include:d2.deep.test include:d3.deep.test include:d4.deep.test -all

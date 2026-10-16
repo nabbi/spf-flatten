@@ -29,9 +29,14 @@ pub fn split_strings(value: &str) -> Vec<String> {
             out.push(std::mem::take(&mut cur));
         }
         cur.push_str(&piece);
-        // A single token over the limit (only possible with long macros) is cut anywhere.
+        // A single token over the limit (only possible with long macros) is cut
+        // anywhere, though never inside a UTF-8 character.
         while cur.len() > MAX_STRING {
-            let rest = cur.split_off(MAX_STRING);
+            let cut = (1..=MAX_STRING)
+                .rev()
+                .find(|&i| cur.is_char_boundary(i))
+                .unwrap_or(MAX_STRING);
+            let rest = cur.split_off(cut);
             out.push(std::mem::replace(&mut cur, rest));
         }
     }
@@ -203,6 +208,15 @@ mod tests {
         assert!(parts.len() > 1);
         assert!(parts.iter().all(|p| p.len() <= MAX_STRING));
         assert!(parts[1].starts_with(' '));
+        assert_eq!(parts.concat(), value);
+    }
+
+    #[test]
+    fn long_token_splits_on_char_boundaries() {
+        // Found by fuzz/split_strings: a cut at byte 255 landed inside 'é'.
+        let value = format!("v=spf1 exp={}", "é".repeat(300));
+        let parts = split_strings(&value);
+        assert!(parts.iter().all(|p| p.len() <= MAX_STRING));
         assert_eq!(parts.concat(), value);
     }
 

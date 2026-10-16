@@ -147,6 +147,13 @@ cargo test
 Requires Rust 1.88 or newer. CIDR aggregation comes from
 [route-summarization](https://crates.io/crates/route-summarization).
 
+`cargo test` includes property tests (`tests/properties.rs`; set
+`PROPTEST_CASES` for longer runs). `fuzz/` holds libFuzzer targets for the SPF
+parser, the config parser, zone fixtures with evaluation, TXT string splitting,
+and the full flatten-then-verify promise. `fuzz/run.sh [target] [seconds]`
+builds and runs them on a stable toolchain; `cargo fuzz run <target>` also
+works where cargo-fuzz and nightly are installed.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

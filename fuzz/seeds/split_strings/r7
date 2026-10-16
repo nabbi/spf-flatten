@@ -1,0 +1,1 @@
+v=spf1 a:gone.example mx:nomx.example include:missing.example -all
