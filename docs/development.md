@@ -16,5 +16,5 @@ builds and runs them on a stable toolchain; `cargo fuzz run <target>` also
 works where cargo-fuzz and nightly are installed.
 
 CI (`.github/workflows/ci.yml`) runs fmt and clippy, the tests on Linux and
-macOS against stable and the 1.88 MSRV, a 20000-case property run, and every
-fuzz target for 60 seconds.
+macOS against stable and the 1.88 MSRV, and a 20000-case property run. Fuzzing
+is too slow for CI; run `fuzz/run.sh` locally.
