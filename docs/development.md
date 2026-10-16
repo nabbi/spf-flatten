@@ -14,3 +14,7 @@ parser, the config parser, zone fixtures with evaluation, TXT string splitting,
 and the full flatten-then-verify promise. `fuzz/run.sh [target] [seconds]`
 builds and runs them on a stable toolchain; `cargo fuzz run <target>` also
 works where cargo-fuzz and nightly are installed.
+
+CI (`.github/workflows/ci.yml`) runs fmt and clippy, the tests on Linux and
+macOS against stable and the 1.88 MSRV, a 20000-case property run, and every
+fuzz target for 60 seconds.
