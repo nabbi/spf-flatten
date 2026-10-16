@@ -61,7 +61,7 @@ brew install nabbi/oubliette/spf-flatten
 Or with Cargo, or from a checkout:
 
 ```sh
-cargo install --locked --git https://github.com/nabbi/spf-flatten
+cargo install --locked spf-flatten
 cargo build --release --locked     # target/release/spf-flatten
 ```
 

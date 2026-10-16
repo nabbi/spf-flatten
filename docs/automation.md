@@ -77,7 +77,7 @@ jobs:
     permissions: { issues: write }
     steps:
       - uses: actions/checkout@v4
-      - run: cargo install --locked --git https://github.com/nabbi/spf-flatten
+      - run: cargo install --locked spf-flatten
       - uses: actions/cache@v4
         with: { path: state.json, key: spf-state-${{ github.run_id }}, restore-keys: spf-state- }
       - name: risk
