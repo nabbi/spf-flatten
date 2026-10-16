@@ -1,0 +1,32 @@
+# Example spf-flatten config. Run: spf-flatten flatten -i examples/spf.toml
+
+domain = "example.com"
+policy = "-all"            # -all, ~all or ?all
+
+# Optional settings, with their defaults:
+# max_lookups = 10         # lookup budget for the result (RFC 7208 limit is 10)
+# max_record_bytes = 450   # per TXT record; keeps answers in one UDP packet
+# chain_prefix = "_spf"    # chained records are _spf1.example.com, _spf2...
+# ttl = 3600               # TTL in zone output
+# apex_ips = true          # put addresses in the apex record when they fit
+# exclude = []             # addresses to remove from the result
+
+[[source]]
+include = "_spf.google.com"
+note = "Google Workspace"
+
+[[source]]
+include = "sendgrid.net"
+note = "transactional mail"
+
+[[source]]
+include = "_spf.salesforce.com"
+keep = true                # publish as a live include instead of flattening
+note = "uses exists:%{i} macros; Salesforce asks customers not to flatten"
+
+[[source]]
+mx = "@"                   # "@" is the domain itself; "@/24" adds a CIDR length
+
+[[source]]
+ip4 = ["203.0.113.10", "198.51.100.0/24"]
+note = "office relays"
