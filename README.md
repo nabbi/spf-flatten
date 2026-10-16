@@ -49,13 +49,24 @@ Global options:
 - [JSON output](docs/json.md): the `--json` schema
 - [Building and testing](docs/development.md): build, property tests, fuzzing
 
-## Build
+## Install
+
+With Homebrew (macOS or Linux), from the
+[oubliette tap](https://github.com/nabbi/homebrew-oubliette):
 
 ```sh
-cargo build --release --locked
+brew install nabbi/oubliette/spf-flatten
 ```
 
-Requires Rust 1.88 or newer.
+Or with Cargo, or from a checkout:
+
+```sh
+cargo install --locked --git https://github.com/nabbi/spf-flatten
+cargo build --release --locked     # target/release/spf-flatten
+```
+
+Requires Rust 1.88 or newer. CIDR aggregation comes from
+[route-summarization](https://github.com/nabbi/route-summarization-rs).
 
 ## License
 
