@@ -1,12 +1,14 @@
 [package]
 name = "spf-flatten"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Flatten SPF records to stay within the RFC 7208 DNS lookup and size limits"
 license = "GPL-3.0-or-later"
 authors = ["Nic Boet"]
 readme = "README.md"
+repository = "https://github.com/nabbi/spf-flatten"
+exclude = [".github/"]
 keywords = ["spf", "dns", "email", "flatten", "dmarc"]
 categories = ["command-line-utilities", "network-programming", "email"]
 
