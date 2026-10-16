@@ -83,10 +83,11 @@ lookups, a missing include target, several SPF records, and so on.
 | `lookups`, `max_lookups` | int | |
 | `void_lookups`, `max_void_lookups` | int | |
 | `policy` | string \| null | the effective `all` |
+| `dmarc` | `{ name, policy }` \| null | the DMARC record that applies and its effective policy (`none`, `quarantine`, `reject`); null when none is published or the lookup failed |
 | `prefixes` | int | prefixes it authorizes |
 | `live` | [Live] | per-message terms (macros, `exists`, `ptr`) |
 | `tree` | [Node] | evaluation tree |
-| `recommendations` | [Advice] | own-host advice |
+| `recommendations` | [Advice] | own-host and `all`/DMARC advice |
 | `suggested` | Plan + `ok`, `needed` | a verified minimal flattening; `needed` is false when the record already fits. On failure: `{ ok: false, error, problems }` |
 
 **Node**: `{ term, lookups, void, ranges, hosts, ttl?, note?, children? }`.
@@ -94,7 +95,8 @@ lookups, a missing include target, several SPF records, and so on.
 records the node itself looked up.
 
 **Advice**: `{ code, term?, message }`. Codes: `redundant-own-host`,
-`mx-inbound-gateway`, `keep-own-host`, `mx-not-authorized`.
+`mx-inbound-gateway`, `keep-own-host`, `mx-not-authorized`, `all-neutral`,
+`softfail-unenforced`, `fail-preempts-dmarc`.
 
 ## import
 

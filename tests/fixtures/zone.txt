@@ -20,3 +20,7 @@ broken.test          TXT "v=spf1 include:missing.test -all"
 cloud.provider.test  300 TXT "v=spf1 ip4:192.0.2.10 ip4:192.0.2.11 ip4:192.0.2.40 ip4:192.0.2.77 ip4:192.0.2.200 -all"
 # Published with --aggressive from cloud.provider.test when it had fewer hosts.
 widened.test         TXT "v=spf1 ip4:192.0.2.0/24 -all"
+
+# -all with an enforcing DMARC policy.
+strict.test          TXT "v=spf1 ip4:192.0.2.0/24 -all"
+_dmarc.strict.test   TXT "v=DMARC1; p=reject"

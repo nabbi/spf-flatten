@@ -137,6 +137,11 @@ fn check_suggests_flattened_records() {
         out.contains("[keep-own-host] mx: authorizes ip4:192.0.2.25"),
         "{out}"
     );
+    assert!(out.contains("dmarc:        none published"), "{out}");
+    assert!(
+        out.contains("[softfail-unenforced] ~all: _dmarc.example.com has no DMARC record"),
+        "{out}"
+    );
 
     let o = run(&["--json", "check", "example.com"], None);
     let v = json_of(&o);
@@ -145,11 +150,22 @@ fn check_suggests_flattened_records() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["lookups"], 6);
     assert_eq!(v["recommendations"][0]["code"], "keep-own-host");
+    // ~all with no DMARC record behind it.
+    assert_eq!(v["dmarc"], serde_json::Value::Null);
+    assert_eq!(v["recommendations"][1]["code"], "softfail-unenforced");
     assert_eq!(v["suggested"]["ok"], true);
     assert_eq!(v["suggested"]["needed"], false);
     assert_eq!(v["suggested"]["lookups"], 6);
     assert_eq!(v["suggested"]["strategy"], "minimal");
     assert_eq!(v["suggested"]["unflattened_lookups"], 6);
+}
+
+#[test]
+fn check_reads_all_against_dmarc() {
+    let v = json_of(&run(&["--json", "check", "strict.test"], None));
+    assert_eq!(v["dmarc"]["policy"], "reject");
+    assert_eq!(v["dmarc"]["name"], "_dmarc.strict.test");
+    assert_eq!(v["recommendations"][0]["code"], "fail-preempts-dmarc");
 }
 
 #[test]

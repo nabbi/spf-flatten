@@ -22,7 +22,7 @@ $ spf-flatten diff -i spf.toml                   # on a schedule: has it drifted
 
 | Command | What it does | Exit 1 when |
 |---|---|---|
-| `check DOMAIN` | Evaluate the published record: lookup tree, limits, own-host advice, and a verified minimal flattening | the record has errors (over 10 lookups, missing includes...) |
+| `check DOMAIN` | Evaluate the published record: lookup tree, limits, own-host and `all`/DMARC advice, and a verified minimal flattening | the record has errors (over 10 lookups, missing includes...) |
 | `import DOMAIN [-o FILE]` | Write a config from the published record, with each source's lookup cost | |
 | `flatten [-i FILE] [-f zone\|json\|plain] [-o FILE]` | Resolve, pack and verify; print the records | |
 | `diff [-i FILE]` | Compare what the config would publish with what DNS serves now | the published records authorize different senders |
@@ -103,6 +103,18 @@ sources to keep live within the spare lookups.
   when flattening, so it follows host moves; `check`'s suggestion does.
 - `mx-not-authorized`: the domain's MX hosts aren't authorized. Only MX hosts
   are checked; a domain's A record is usually its website, not a mail sender.
+
+It also reads the `all` qualifier alongside the domain's DMARC policy, found at
+`_dmarc.<domain>` or the nearest parent (using the parent's `sp=` when set):
+
+- `all-neutral`: `?all` gives unlisted senders the same result as no SPF.
+- `softfail-unenforced`: `~all` with no DMARC record, or `p=none`, so
+  unlisted senders are usually still delivered.
+- `fail-preempts-dmarc`: `-all` with `p=quarantine` or `p=reject`. Some
+  receivers reject on the SPF fail before DMARC can accept a forwarded message
+  on its DKIM signature; `~all` leaves that decision to DMARC.
+
+`~all` with an enforcing DMARC policy, and `-all` without one, get no advice.
 
 ## Config
 

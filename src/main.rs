@@ -589,9 +589,29 @@ fn check_cmd(ctx: &Ctx, domain: &str) -> Result<Report, Fatal> {
         flat.live.len()
     ));
 
-    let recommendations = spf::Record::parse(&record)
+    let dmarc = match advice::dmarc(&domain, ctx.dns) {
+        Ok(d) => {
+            text.push_str(&format!(
+                "dmarc:        {}\n",
+                d.as_ref().map_or("none published".into(), |d| format!(
+                    "p={} at {}",
+                    d.policy, d.name
+                ))
+            ));
+            Some(d)
+        }
+        Err(e) => {
+            ctx.note(&format!("DMARC not checked: {e}"));
+            None
+        }
+    };
+
+    let mut recommendations = spf::Record::parse(&record)
         .map(|r| advice::own_hosts(&domain, &r, ctx.dns))
         .unwrap_or_default();
+    if let Some(d) = &dmarc {
+        recommendations.extend(advice::policy(&domain, flat.all, d.as_ref()));
+    }
     if !recommendations.is_empty() {
         text.push_str("\nrecommendations:\n");
         for a in &recommendations {
@@ -653,6 +673,7 @@ fn check_cmd(ctx: &Ctx, domain: &str) -> Result<Report, Fatal> {
         "void_lookups": flat.voids,
         "max_void_lookups": MAX_VOIDS,
         "policy": flat.all.map(|q| format!("{}all", q.prefix())),
+        "dmarc": dmarc.flatten(),
         "prefixes": prefixes,
         "live": flat.live,
         "tree": flat.tree,

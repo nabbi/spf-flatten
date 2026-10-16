@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Recommendations about a domain's own hosts: `a` and `mx` terms that add
 //! nothing, `mx` terms that point at inbound-only gateways, and MX hosts that
-//! aren't authorized at all.
+//! aren't authorized at all. Also the `all` policy, read alongside DMARC.
 
 use route_summarization::Range;
 use serde::Serialize;
 
-use crate::dns::Dns;
+use crate::dns::{Dns, DnsError};
 use crate::eval::Evaluator;
 use crate::flatten::{ip_term, summarize};
 use crate::spf::{HostSpec, Mechanism, Qualifier, Record, Term};
@@ -160,6 +160,121 @@ pub fn own_hosts(domain: &str, record: &Record, dns: &dyn Dns) -> Vec<Advice> {
     out
 }
 
+/// The DMARC policy that applies to a domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Dmarc {
+    /// Where the record was found: `_dmarc.<domain>` or a parent's.
+    pub name: String,
+    /// `none`, `quarantine` or `reject`: `sp` when inherited from a parent
+    /// that sets it, otherwise `p`.
+    pub policy: String,
+}
+
+impl Dmarc {
+    /// True if receivers are asked to act on failing mail.
+    pub fn enforcing(&self) -> bool {
+        self.policy != "none"
+    }
+}
+
+/// The tags of a `v=DMARC1` record, or `None` if `txt` isn't one.
+fn dmarc_tags(txt: &str) -> Option<Vec<(String, String)>> {
+    let mut parts = txt.split(';').map(str::trim);
+    let version = parts.next()?.split_once('=')?;
+    if !(version.0.trim().eq_ignore_ascii_case("v") && version.1.trim() == "DMARC1") {
+        return None;
+    }
+    Some(
+        parts
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase()))
+            .collect(),
+    )
+}
+
+/// Find the DMARC policy for `domain`: `_dmarc.<domain>`, then each parent up
+/// to (not including) the top-level domain, as in the DMARCbis tree walk.
+/// `Ok(None)` means no valid record exists.
+pub fn dmarc(domain: &str, dns: &dyn Dns) -> Result<Option<Dmarc>, DnsError> {
+    let labels: Vec<&str> = domain.split('.').collect();
+    for i in 0..labels.len().saturating_sub(1).min(8) {
+        let name = format!("_dmarc.{}", labels[i..].join("."));
+        let records: Vec<_> = dns
+            .txt(&name)?
+            .iter()
+            .filter_map(|t| dmarc_tags(t))
+            .collect();
+        // Several DMARC records are as good as none (RFC 7489 §6.6.3).
+        let [tags] = records.as_slice() else {
+            continue;
+        };
+        let tag = |k: &str| {
+            tags.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        let policy = match (i, tag("sp")) {
+            (1.., Some(sp)) => sp,
+            _ => tag("p").unwrap_or("none"),
+        };
+        let policy = match policy {
+            "quarantine" | "reject" => policy,
+            _ => "none",
+        };
+        return Ok(Some(Dmarc {
+            name,
+            policy: policy.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+/// Advice on the record's `all` qualifier, given the domain's DMARC policy.
+/// `+all` and a missing `all` are reported as problems, not here.
+pub fn policy(domain: &str, all: Option<Qualifier>, dmarc: Option<&Dmarc>) -> Vec<Advice> {
+    let enforcing = dmarc.is_some_and(Dmarc::enforcing);
+    let advice = |code, term: &str, message: String| Advice {
+        code,
+        term: Some(term.into()),
+        message,
+    };
+    match all {
+        Some(Qualifier::Neutral) => vec![advice(
+            "all-neutral",
+            "?all",
+            "?all: unlisted senders get neutral, the same as having no SPF record; \
+             use ~all with a DMARC policy, or -all"
+                .into(),
+        )],
+        Some(Qualifier::SoftFail) if !enforcing => {
+            let dmarc = match dmarc {
+                Some(d) => format!("{} has p={}", d.name, d.policy),
+                None => format!("_dmarc.{domain} has no DMARC record"),
+            };
+            vec![advice(
+                "softfail-unenforced",
+                "~all",
+                format!(
+                    "~all: {dmarc}, so unlisted senders are only marked suspicious and \
+                     usually delivered; publish DMARC with p=quarantine or p=reject, or use -all"
+                ),
+            )]
+        }
+        Some(Qualifier::Fail) if enforcing => vec![advice(
+            "fail-preempts-dmarc",
+            "-all",
+            format!(
+                "-all: some receivers reject on the SPF fail before DMARC runs, losing \
+                 forwarded mail that a DKIM pass would have saved; with p={} at {}, \
+                 ~all leaves the decision to DMARC",
+                dmarc.map_or("", |d| d.policy.as_str()),
+                dmarc.map_or("", |d| d.name.as_str()),
+            ),
+        )],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +334,68 @@ mod tests {
         );
         // Only the MX host is reported; the website's A record is not.
         assert_eq!(got, [("mx-not-authorized", None)]);
+    }
+
+    fn policy_codes(zone: &str, all: Qualifier) -> Vec<&'static str> {
+        let dns = StaticDns::parse(zone).unwrap();
+        let d = dmarc("mail.example.com", &dns).unwrap();
+        policy("mail.example.com", Some(all), d.as_ref())
+            .into_iter()
+            .map(|a| a.code)
+            .collect()
+    }
+
+    #[test]
+    fn dmarc_lookup_walks_up_and_uses_sp() {
+        let dns = StaticDns::parse(
+            r#"
+            _dmarc.example.com TXT "v=DMARC1; p=reject; sp=quarantine; rua=mailto:d@example.com"
+            _dmarc.direct.example.com TXT "v=DMARC1;p=none"
+            _dmarc.two.example.com TXT "v=DMARC1; p=reject"
+            _dmarc.two.example.com TXT "v=DMARC1; p=none"
+            _dmarc.bogus.example.com TXT "v=spf1 -all"
+            "#,
+        )
+        .unwrap();
+        let got = |d: &str| dmarc(d, &dns).unwrap().map(|d| (d.name, d.policy));
+        assert_eq!(
+            got("example.com"),
+            Some(("_dmarc.example.com".into(), "reject".into()))
+        );
+        assert_eq!(
+            got("a.b.example.com"),
+            Some(("_dmarc.example.com".into(), "quarantine".into()))
+        );
+        assert_eq!(
+            got("direct.example.com"),
+            Some(("_dmarc.direct.example.com".into(), "none".into()))
+        );
+        // Two records count as none; the walk goes on to the parent.
+        assert_eq!(got("two.example.com").unwrap().0, "_dmarc.example.com");
+        assert_eq!(got("bogus.example.com").unwrap().0, "_dmarc.example.com");
+        assert_eq!(got("example.org"), None);
+    }
+
+    #[test]
+    fn all_qualifier_against_dmarc() {
+        let reject = r#"_dmarc.example.com TXT "v=DMARC1; p=reject""#;
+        let monitor = r#"_dmarc.example.com TXT "v=DMARC1; p=none""#;
+        assert_eq!(policy_codes("", Qualifier::Neutral), ["all-neutral"]);
+        assert_eq!(policy_codes(reject, Qualifier::Neutral), ["all-neutral"]);
+        assert_eq!(
+            policy_codes("", Qualifier::SoftFail),
+            ["softfail-unenforced"]
+        );
+        assert_eq!(
+            policy_codes(monitor, Qualifier::SoftFail),
+            ["softfail-unenforced"]
+        );
+        assert!(policy_codes(reject, Qualifier::SoftFail).is_empty());
+        assert_eq!(
+            policy_codes(reject, Qualifier::Fail),
+            ["fail-preempts-dmarc"]
+        );
+        assert!(policy_codes(monitor, Qualifier::Fail).is_empty());
+        assert!(policy_codes("", Qualifier::Fail).is_empty());
     }
 }
